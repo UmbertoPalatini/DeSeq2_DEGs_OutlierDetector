@@ -1,390 +1,399 @@
-# Post-DESeq2 Outlier-Driven DEG Detection
+# Post-DESeq2 outlier and artifact annotation for small-n RNA-seq
 
-[![R](https://img.shields.io/badge/R-%3E%3D4.0-blue)](https://www.r-project.org/)
+[![R](https://img.shields.io/badge/R-%E2%89%A54.0-blue)](https://www.r-project.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A post-hoc analysis tool that identifies differentially expressed genes (DEGs) whose statistical significance may be driven by single-sample outliers, regardless of whether these outliers are techical errors or real biological "chaos", rather than consistent biological differences. This approach helps distinguish between technical artifacts and legitimate biological variation in RNA-seq differential expression results.
+A post-hoc annotation tool for differential expression results from DESeq2
+(or edgeR / limma-voom). It does **not** re-run the test. It takes the table
+of significant genes, the library-size-normalised count matrix, and the
+sample sheet, and for each significant DEG asks whether the call is
+supported by a group-level expression pattern or by a small number of
+samples whose behaviour is incompatible with a group-level inference.
 
-## Background
+Each DEG receives one of three labels:
 
-While DESeq2 and edgeR are powerful tools for differential expression analysis, they can produce inflated false positive rates when outlier samples violate distributional assumptions. Rather than applying aggressive pre-filtering that might remove legitimate biological variation, this script performs targeted post-analysis to identify genes where significance depends on extreme outliers.
-Some references:
-- PMID: 33709073
-- PMID: 40926263
-- PMID: 25516281
-- PMID: 39478636
+| Flag | Meaning |
+|---|---|
+| **Clean** | Expression difference is consistent across samples of each group. |
+| **Outliers_Present** | One or more samples are extreme, but the group-level pattern is still coherent. |
+| **Artifact** | The DEG call is attributable to a single or few samples, or to expression confined to a handful of samples overall. |
 
-## Key Features
+The caller decides what to do with those labels. The tool itself never
+drops genes.
 
-- **Post-hoc analysis**: Works with existing DESeq2/edgeR results without re-running differential expression
-- **Balanced outlier detection**: Uses multiple methods tuned to catch technical artifacts while preserving biological variation
-- **Group-aware assessment**: Considers experimental design when evaluating outlier patterns
-- **Comprehensive output**: Provides both flagged outliers and complete annotated results table
-- **nf-core compatible**: Designed to work seamlessly with nf-core/differentialabundance pipeline output
+
+## Why this step exists
+
+DESeq2 and edgeR model gene-wise counts with a negative binomial GLM and
+use information-sharing across genes (dispersion shrinkage, Cook's-distance
+outlier flagging) to stabilise estimates in small experiments. These
+safeguards are powerful but not exhaustive. Two situations recur in
+small-n studies (typically four to six biological replicates per group,
+common for RNA-seq from individual animals or manually microdissected
+tissue) in which the statistical model can return a significant p-value
+even though the underlying expression pattern does not represent a
+group-level regulatory difference:
+
+1. **One biological replicate carries an extreme value** that pulls the
+   group mean far from the other replicates in that group. The fitted
+   log-fold-change is real in the arithmetic sense, but it is not a
+   property of the group. Remove that single sample and the difference
+   evaporates. With five replicates per group, one extreme sample is
+   20% of the group.
+
+2. **A gene is expressed in only a handful of samples across the entire
+   contrast.** In the extreme, one or two samples have non-zero counts
+   and the rest are at zero. DESeq2 can still return a small padj after
+   dispersion shrinkage borrows information from higher-count genes,
+   but within-group variance is essentially undefined for a gene
+   expressed in so few samples, and the DEG call cannot speak to a
+   regulated response.
+
+DESeq2's built-in Cook's-distance machinery (outlier replacement and
+Cook's-based p-value filtering) partly addresses case 1, but both
+behaviours are tied to sample size by design. Outlier replacement
+requires at least seven replicates per group, and Cook's-based filtering
+of individual p-values is not applied when the smaller group has three
+or fewer samples, which is the regime most at risk. Case 2 is not
+addressed by Cook's distance at all, because it is a property of the
+full expression vector across samples and not of a single large residual.
+
+The script annotates both situations explicitly.
+
+**Design note on genes expressed in only one group:** A gene with zero
+counts in all samples of one group but consistent, high expression in
+all samples of the other group is a biologically valid signal
+(complete induction from a silent baseline). This script retains such
+genes as Clean, because rule 2 (sparse expression) only fires when
+fewer than three samples express the gene across the entire contrast —
+a gene expressed in all five replicates of the treatment group has five
+non-zero observations and passes comfortably. Genes whose non-zero
+signal is confined to one or two samples regardless of group membership
+are a different matter and are flagged as Artifact under rule 2.
+
+**Relevant methodology references:**
+PMID 33709073, PMID 40926263, PMID 25516281, PMID 39478636.
+
+
+## Contents
+
+```
+DEGs_filtering_GitHub_v2/
+├── DEGs_outlier_detection_postDeSeq.R    # main annotation script
+├── plot_outlier_heatmap.R                # diagnostic heatmap helper
+├── example_run.R                         # end-to-end demo
+├── example_data/
+│   ├── generate_example_data.R           # reproducible synthetic dataset
+│   ├── example_normalized_counts.tsv
+│   ├── example_results.tsv
+│   ├── example_samplesheet.tsv
+│   ├── example_annotated_results.tsv     # produced by example_run.R
+│   └── example_heatmap.png               # produced by example_run.R
+└── README.md
+```
+
 
 ## Installation
 
-### Dependencies
-
 ```r
-# Required packages
-install.packages(c("dplyr"))
-
-# DESeq2 for data handling (optional, only needed for column names)
-if (!require("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
-BiocManager::install("DESeq2")
+install.packages(c("dplyr", "pheatmap"))
 ```
 
-### Download
+No Bioconductor packages are required for annotation itself. DESeq2 is
+only needed upstream to produce the inputs.
 
-```bash
-# Download the script
-wget https://raw.githubusercontent.com/yourusername/repo/main/DEGs_outlier_detection_postDeSeq_v5_final.r
 
-# Or clone the repository
-git clone https://github.com/yourusername/outlier-deg-detection.git
-```
-
-## Quick Start
+## Quick start
 
 ```r
-# Load the script
-source("DEGs_outlier_detection_postDeSeq_v5_final.r")
+source("DEGs_outlier_detection_postDeSeq.R")
 
-# Run analysis on your data
-outlier_analysis <- analyze_differentialabundance_outliers(
-  results_file = "deseq2.results.tsv",
+res <- analyze_differentialabundance_outliers(
+  results_file           = "deseq2.results.tsv",
   normalized_counts_file = "deseq2.normalised_counts.tsv",
-  sample_sheet_file = "samplesheet.tsv"
+  sample_sheet_file      = "samplesheet.tsv"
 )
 
-# View results
-View(outlier_analysis$comprehensive_results)
+# Full annotated results table
+head(res$comprehensive_results)
 
-# Save annotated results
-write.table(outlier_analysis$comprehensive_results, 
-           "deg_results_with_outlier_analysis.tsv", 
-           sep = "\t", quote = FALSE, row.names = TRUE)
+# Flag counts
+res$summary
 ```
 
-## Input Requirements
+To see which samples drive each flagged gene, use the optional heatmap
+helper:
 
-### Required Files
+```r
+source("plot_outlier_heatmap.R")
 
-| File | Description | Expected Format |
-|------|-------------|-----------------|
-| **Results Table** | DESeq2/edgeR differential expression results | TSV with `padj` or `adj.P.Val` column |
-| **Normalized Counts** | Library-size normalized expression matrix | TSV, genes as rows, samples as columns |
-| **Sample Sheet** | Sample metadata with group assignments | TSV with sample IDs and condition/group column |
-
-### File Formats
-
-**Results Table** (from DESeq2/edgeR):
-```
-gene_id         baseMean    log2FoldChange  padj
-GENE001         1234.5      2.1            0.001
-GENE002         567.8       -1.8           0.05
+plot_outlier_heatmap(
+  annotation             = res,
+  normalized_counts_file = "deseq2.normalised_counts.tsv",
+  sample_sheet_file      = "samplesheet.tsv",
+  output_file            = "deg_heatmap.png"
+)
 ```
 
-**Normalized Counts**:
-```
-gene_id         Sample1     Sample2     Sample3     Sample4
-GENE001         120.5       89.2        156.1       203.7
-GENE002         45.2        67.1        23.8        89.4
-```
 
-**Sample Sheet**:
-```
-sample_id       condition   batch
-Sample1         control     1
-Sample2         control     1
-Sample3         treatment   2
-Sample4         treatment   2
-```
+## Inputs
 
-## Algorithm Overview
+| File | Description | Format |
+|---|---|---|
+| Results table | DESeq2 or edgeR output | TSV with a `padj` (or `adj.P.Val`) column and ideally `log2FoldChange` (or `logFC`). Row names or first column are gene IDs. |
+| Normalized counts | Library-size normalised matrix | TSV. Rows are genes, columns are samples. |
+| Sample sheet | Sample metadata | TSV with one row per sample. Must contain a sample identifier column (`sample_id`, or `sample`, or the first column) and a contrast-group column (`condition`, `group`, `treatment`, and so on, otherwise the second column is used). |
 
-### Outlier Detection Methods
+The script reads nf-core/differentialabundance outputs without modification
+(`deseq2.results.tsv`, `deseq2.normalised_counts.tsv` and the original
+`samplesheet.csv/tsv`).
 
-The script uses multiple complementary approaches to identify outliers:
 
-1. **Ratio-based Detection**: Flags values >20x median (balanced threshold)
-2. **Zero-heavy Data Handling**: Uses 10x mean for datasets with many zeros
-3. **Extreme Value Detection**: Flags values >1000x minimum non-zero value
-4. **Conservative IQR**: Uses 3×IQR threshold (instead of standard 1.5×IQR)
+## Algorithm
 
-**Threshold Philosophy**: The detection methods are calibrated to catch extreme technical artifacts (e.g., single samples with 100-1000x higher expression than background) while preserving legitimate biological differences between experimental groups (typically 2-20x fold changes).
+For every significant DEG the script runs two annotation rules. A gene
+can be flagged by both.
 
-### Artifact Assessment
+### Rule 1. Single-sample outlier detection
 
-Genes are classified as likely artifacts when **ALL** of the following conditions are met:
+For each DEG the full vector of normalized counts across samples is
+examined with four criteria:
 
-**Required conditions:**
-- ≤2 outlier samples total
-- Sufficient remaining samples in each group (≥ `min_samples_consistent`)
-- All outliers concentrated in a single experimental group
+* the ratio to the sample median, which catches moderate spikes in
+  otherwise balanced vectors.
+* a fallback based on the ratio to the sample mean when the median is
+  zero, needed when many samples do not express the gene.
+* the ratio to the smallest non-zero value, which catches patterns in
+  which most samples sit just above the detection floor and one sample
+  is orders of magnitude higher.
+* a robust IQR test, which flags values well above the third quartile
+  of the distribution of the remaining samples.
 
-**AND at least ONE magnitude criterion:**
-- Extreme absolute values (>10,000 normalized counts)
-- Extreme ratio (>100x median of all samples)
-- High ratio (>50x median) OR (>10x max non-outlier value AND >1000 absolute)
+A sample that departs from the rest of the distribution under any of
+these criteria is called an outlier. A gene is flagged as **Artifact**
+when the outlier sample or samples are confined to a single contrast
+group and are either extreme in absolute expression or extreme relative
+to the non-outlier samples of that same group, such that removing them
+would render the two groups indistinguishable at the group level. If
+outliers exist but the group-level pattern remains coherent, that is,
+the non-outlier samples of each group still separate, the gene is
+flagged as **Outliers_Present** and retained.
 
-## Output Structure
+The criteria are heuristic and magnitude-aware. A simple percentile-based
+cut would be too aggressive on small samples, where any RNA-seq vector
+has an empirical extremum. Biological differences in bulk transcriptomics
+typically fall within roughly one order of magnitude between groups and
+are preserved. The rule is tuned to act on departures that are
+substantially larger, of the order of one to three orders of magnitude
+above the remaining samples, which in practice is the pattern most
+frequently associated with technical artefacts such as PCR jackpotting,
+mis-mapping, or contamination.
 
-### Main Results: `comprehensive_results`
+### Rule 2. Sparse expression
 
-Enhanced version of your original results table with added outlier analysis columns:
+Independently of rule 1, any DEG expressed (non-zero counts) in fewer
+than `min_expressing_samples` across the entire contrast is flagged as
+**Artifact** with type `sparse_expression`. The default is three.
+
+The rationale is statistical rather than purely about outliers. A gene
+with non-zero counts in fewer than three samples provides essentially no
+within-group variance information, because for at least one of the two
+groups the variance is being estimated from a single non-zero observation
+or none. The negative-binomial dispersion estimator is still formally
+defined, but under small-n designs dispersion shrinkage pulls such genes
+toward the prior and can yield standard errors that are small relative
+to the observed effect even though the effect itself rests on one or two
+data points. A contrast-level difference supported by a single expressing
+sample in a single group is not separable from individual-level variation
+or from a single mis-labelled or contaminated library, and the script is
+conservative about treating it as evidence of a group response.
+
+Note that rule 2 does **not** fire on genes that are expressed in all
+replicates of one group and zero in the other, because in that case the
+total number of expressing samples equals the group size and easily
+exceeds the `min_expressing_samples` threshold. Such genes (complete
+induction or complete repression) are biologically coherent signals and
+are retained as Clean, with the per-group expression distribution
+visible in the annotated output.
+
+The two rules are evaluated in order (1, then 2), and rule 2 can
+overwrite an earlier Clean call to Artifact when the global expression
+count warrants it. A gene that passes both rules is labelled **Clean**,
+or **Outliers_Present** if rule 1 detected outliers without triggering
+an Artifact call.
+
+
+## Output
+
+The return value is a list with three elements.
+
+### `comprehensive_results`
+
+The original results table, with the following columns appended:
 
 | Column | Description |
-|--------|-------------|
-| `outlier_flag` | **"Clean"**, **"Outliers_Present"**, or **"Artifact"** |
-| `likely_artifact` | Boolean flag for probable false positives |
-| `has_outliers` | Whether outliers were detected |
-| `outlier_type` | Type of outlier: "high_expression", "low_expression", or "moderate" |
-| `outlier_samples` | Which samples are outliers (semicolon-separated) |
-| `outlier_values` | The actual outlier expression values (semicolon-separated) |
-| `non_outlier_range` | Min-max range of non-outlier expression values |
-| `group_pattern` | Distribution of outliers across experimental groups |
+|---|---|
+| `outlier_flag` | One of `Clean`, `Outliers_Present`, `Artifact`. |
+| `likely_artifact` | Boolean, `TRUE` if `outlier_flag == "Artifact"`. |
+| `has_outliers` | `TRUE` if any rule flagged the gene. |
+| `outlier_type` | `high_expression`, `low_expression`, `moderate`, or `sparse_expression`. |
+| `outlier_samples` | Samples implicated by the rule that fired (semicolon-separated). |
+| `outlier_values` | Their normalized counts. |
+| `non_outlier_range` | Range of the non-outlier samples (for rule 1). |
+| `group_pattern` | Distribution of outliers (rule 1) or total expressing-sample count (rule 2). |
 
-### Detailed Analysis: `outlier_flags`
+### `outlier_flags`
 
-Subset containing only genes with detected outliers, with full diagnostic information.
+Subset of `comprehensive_results` restricted to genes that triggered any
+rule, for manual inspection.
 
-### Summary Statistics: `summary`
+### `summary`
 
-Count of genes in each category for quick assessment.
+A named list with `total_degs`, `clean_degs`, `outliers_present`,
+`likely_artifacts`, and `degs_with_flags`.
 
-## Interpretation Guide
-
-### Gene Categories
-
-**Clean Genes** (`outlier_flag = "Clean"`)
-- No outliers detected
-- High confidence in differential expression call
-- Safe to include in downstream analysis
-
-**Outliers Present** (`outlier_flag = "Outliers_Present"`)
-- Outliers detected but likely biological variation
-- Examples: Moderate fold-changes (5-20x) with consistent patterns
-- Generally safe to include, consider manual review
-
-**Likely Artifacts** (`outlier_flag = "Artifact"`)
-- Extreme outliers driving statistical significance
-- Examples: Single samples with 100x+ expression vs background
-- **Recommend exclusion** from downstream analysis
-
-### Example Cases
-
-**Clear Artifact**:
-```
-Gene: EXAMPLE001
-Values: [0, 0, 0, 0, 8844, 0, 0, 0, 0, 1, 0, 0]
-Classification: Artifact (single 8844x outlier vs ~0.5 background)
-```
-
-**Biological Variation**:
-```
-Gene: EXAMPLE002  
-Values: [15210, 7255, 7864, 3865, 3054, 2163, 2779, 2284, 3531, 1849, 518, 2263, 1628]
-Classification: Clean (5.5x ratio - legitimate group differences)
-```
-
-**Robust Signal**:
-```
-Gene: EXAMPLE003
-Values: [120, 110, 135, 125, 450, 478, 523, 467, 445, 489, 501, 456]
-Classification: Clean (consistent group differences)
-```
 
 ## Parameters
 
 | Parameter | Default | Description |
-|-----------|---------|-------------|
-| `padj_threshold` | 0.05 | Significance threshold for DEG inclusion |
-| `outlier_threshold` | 3 | Legacy parameter (passed to functions but not used in current implementation) |
-| `min_samples_consistent` | 2 | Minimum non-outlier samples required per group |
+|---|---:|---|
+| `padj_threshold` | `0.05` | Adjusted-p-value threshold used to select the DEGs that enter the annotation. |
+| `min_samples_consistent` | `2` | Minimum number of non-outlier samples required in each group for rule 1 to flag a gene as Artifact. Prevents flagging when too few non-outlier samples remain to judge the group-level pattern. |
+| `min_expressing_samples` | `3` | Minimum number of samples with non-zero counts across the contrast for a gene to pass rule 2. |
 
-## Usage Examples
 
-### Basic Analysis
+## Worked example
 
-```r
-# Standard analysis
-results <- analyze_differentialabundance_outliers(
-  results_file = "my_deseq_results.tsv",
-  normalized_counts_file = "my_normalized_counts.tsv",
-  sample_sheet_file = "my_samples.tsv"
-)
+A synthetic dataset is shipped under `example_data/` and can be
+regenerated with `generate_example_data.R`. It contains 41 genes and 10
+samples (two groups of five) covering:
 
-# Check summary
-print(results$summary)
-#> $total_degs: 150
-#> $clean_degs: 120
-#> $likely_artifacts: 8
-#> $robust_degs: 22
-```
+* 8 robust DEGs (consistent fold change up or down) — expected **Clean**.
+* 4 zero-in-one-group DEGs: all control replicates are zero, all treatment
+  replicates express the gene at high and consistent levels (complete
+  induction from a silent baseline) — expected **Clean**.
+* 3 Outliers_Present: one treatment replicate is ~8x the group median,
+  the remaining four replicates still separate from control — expected
+  **Outliers_Present**.
+* 4 spike artifacts: one treatment replicate carries 14,000–27,000
+  normalised counts while the rest of the contrast sits near zero —
+  expected **Artifact** (rule 1).
+* 4 sparse_expression artifacts: expressed in only 1–2 samples total —
+  expected **Artifact** (rule 2).
+* 18 non-DEG background genes (padj > 0.05, not annotated).
 
-### Filter Results for Clean Gene List
-
-```r
-# Get high-confidence DEGs (exclude artifacts)
-clean_degs <- results$comprehensive_results[
-  results$comprehensive_results$outlier_flag != "Artifact", 
-]
-
-# Or be more conservative (only clean genes)
-very_clean_degs <- results$comprehensive_results[
-  results$comprehensive_results$outlier_flag == "Clean", 
-]
-
-# Save filtered results
-write.table(clean_degs, "filtered_deg_results.tsv", 
-           sep = "\t", quote = FALSE, row.names = TRUE)
-```
-
-### Manual Review of Flagged Genes
-
-```r
-# View only flagged artifacts
-artifacts <- results$outlier_flags[results$outlier_flags$likely_artifact, ]
-View(artifacts)
-
-# Export for manual review
-write.table(artifacts, "genes_flagged_as_artifacts.tsv", 
-           sep = "\t", quote = FALSE, row.names = FALSE)
-```
-
-### Test Outlier Detection on Custom Data
-
-```r
-# Test the outlier detection function directly
-test_counts <- c(15210.78, 7255.144, 7863.838, 3865.132, 3054.153, 
-                 2162.5, 2779.326, 2284.098, 3530.547, 1848.999, 
-                 517.8544, 2262.534, 1627.743)
-names(test_counts) <- paste0("Sample", 1:13)
-
-result <- identify_outliers(test_counts, NULL, 3)
-print(result$has_outliers)  # Should be FALSE for biological variation
-```
-
-## Workflow Integration
-
-### With nf-core/differentialabundance
+Run the demo with:
 
 ```bash
-# After running nf-core/differentialabundance
-nextflow run nf-core/differentialabundance --input samplesheet.csv --contrasts contrasts.csv
+Rscript example_run.R
+```
+
+Expected summary:
+
+```
+total_degs        : 23
+clean_degs        : 12     # 8 robust + 4 zero-in-one-group DEGs
+outliers_present  :  3
+likely_artifacts  :  8     # 4 spike + 4 sparse
+```
+
+The accompanying heatmap (saved to `example_data/example_heatmap.png`)
+shows all 23 annotated DEGs ordered by flag and clustered by column,
+with left-hand annotation bars indicating flag status and artifact
+subtype:
+
+![Example heatmap](example_data/example_heatmap.png)
+
+The top block (green, Clean) shows both the robust fold-change DEGs and
+the zero-in-one-group genes: all control samples have low or zero counts
+while all treatment samples are consistently elevated — a coherent
+biological signal. The middle block (yellow, Outliers_Present) shows
+genes where one treatment sample is markedly elevated above its peers
+but the remaining replicates still separate from control. The bottom
+block (red, Artifact) contains spike artifacts (one saturated cell per
+row) and sparse-expression artifacts (one or two lone expressing cells
+per row, scattered across groups).
+
+The zero-in-one-group Clean genes illustrate the key design decision of
+this script: a gene that is zero in all control replicates but high and
+consistent across all treatment replicates reflects a real transcriptional
+change, not a stochastic dropout artefact. Flagging it as Artifact would
+be scientifically incorrect. Rule 2 correctly passes it because the total
+number of expressing samples (five) meets the `min_expressing_samples`
+threshold. Compare this to the sparse-expression Artifacts, where only
+one or two samples across the entire contrast are non-zero: there the
+signal is indistinguishable from individual-level noise.
+
+
+## Integration with nf-core/differentialabundance
+
+```bash
+nextflow run nf-core/differentialabundance -r 1.5.0 \
+    -profile singularity \
+    --input samplesheet.csv \
+    --matrix gene_counts_length_scaled.tsv \
+    --contrasts contrasts.csv \
+    --outdir results/
 ```
 
 ```r
-# Point to nf-core outputs
-results <- analyze_differentialabundance_outliers(
-  results_file = "results/deseq2/condition_treatment_vs_control/deseq2.condition_treatment_vs_control.results.tsv",
+source("DEGs_outlier_detection_postDeSeq.R")
+
+res <- analyze_differentialabundance_outliers(
+  results_file           = "results/deseq2/condition_treatment_vs_control/deseq2.condition_treatment_vs_control.results.tsv",
   normalized_counts_file = "results/deseq2/normalised_counts/deseq2.normalised_counts.tsv",
-  sample_sheet_file = "samplesheet.csv"  # Your original input
+  sample_sheet_file      = "samplesheet.csv"
 )
 ```
 
-### Integration with Standard DESeq2 Workflow
+
+## Integration with a standard DESeq2 workflow
 
 ```r
-# After standard DESeq2 analysis
+library(DESeq2)
 dds <- DESeq(dds)
 res <- results(dds)
 
-# Save intermediate files for outlier analysis
-write.table(res, "deseq2_results.tsv", sep = "\t", quote = FALSE)
-write.table(counts(dds, normalized = TRUE), "normalized_counts.tsv", sep = "\t", quote = FALSE)
+write.table(as.data.frame(res),
+            "deseq2_results.tsv", sep = "\t", quote = FALSE)
+write.table(counts(dds, normalized = TRUE),
+            "normalized_counts.tsv", sep = "\t", quote = FALSE)
 
-# Run outlier detection
-outlier_results <- analyze_differentialabundance_outliers(
-  results_file = "deseq2_results.tsv",
-  normalized_counts_file = "normalized_counts.tsv", 
-  sample_sheet_file = "sample_metadata.tsv"
+source("DEGs_outlier_detection_postDeSeq.R")
+annot <- analyze_differentialabundance_outliers(
+  results_file           = "deseq2_results.tsv",
+  normalized_counts_file = "normalized_counts.tsv",
+  sample_sheet_file      = "sample_metadata.tsv"
 )
 ```
 
-## Tuning and Validation
 
-### Threshold Sensitivity
+## Scope and caveats
 
-The current thresholds are designed to be balanced:
-- **20x median**: Catches extreme single-sample spikes while preserving group differences
-- **3×IQR**: Conservative IQR detection to avoid false positives
-- **1000x minimum**: Extreme ratio detection for very sparse data
+* The script is designed for small-n bulk RNA-seq experiments (roughly
+  three to eight samples per group). Larger designs tend to handle the
+  situations above natively through DESeq2's own outlier machinery.
+* It operates on count-based library-size-normalised expression.
+  Log-transformed or variance-stabilised abundances (VST, rlog, CPM, TPM)
+  are not on the same scale as counts, so rule 1's absolute-magnitude
+  criteria should be interpreted relatively when applied to those inputs.
+* The rules are conservative with respect to biological variation.
+  Moderate group differences, bimodal group distributions produced by
+  real heterogeneity, and consistent minor-allele-like patterns are
+  preserved as Clean or Outliers_Present.
+* Annotations are a starting point for review. Genes flagged in a
+  study-critical contrast should be inspected individually. The
+  `outlier_samples` and `group_pattern` fields, together with the
+  heatmap, make that inspection fast.
 
-### Validation Approach
-
-1. **Visual inspection**: Examine flagged vs clean genes manually
-2. **Biological validation**: Check if flagged genes make biological sense
-3. **Threshold adjustment**: Modify parameters based on your data characteristics
-
-### Custom Threshold Example
-
-```r
-# For more sensitive detection (catches more outliers)
-# Modify the identify_outliers function thresholds:
-# - Change 20x to 15x median
-# - Change 3*IQR to 2*IQR
-
-# For more conservative detection (catches fewer outliers)  
-# - Change 20x to 50x median
-# - Change 3*IQR to 5*IQR
-```
-
-## Limitations
-
-- **Small sample sizes**: Less effective with <4 samples per group
-- **Legitimate extreme biology**: May flag genuine biological extremes (rare but possible)
-- **Count data optimized**: Designed specifically for RNA-seq count matrices
-- **Manual review recommended**: Automated flags should be verified by domain experts
-- **Threshold dependency**: Performance depends on appropriate threshold selection for your data type
-
-## Performance
-
-- **Runtime**: ~1-2 seconds per 1000 genes analyzed
-- **Memory**: Minimal additional memory beyond input data
-- **Scalability**: Tested with datasets up to 50,000 genes and 200 samples
-
-## Troubleshooting
-
-### Common Issues
-
-**"No matching samples" error**:
-- Check sample name consistency between files
-- Ensure no extra spaces or special characters
-- Verify column headers match expected format
-
-**"Cannot find adjusted p-value column"**:
-- Ensure results file contains `padj` or `adj.P.Val` column
-- Check that results file is properly formatted
-
-**Too many/few outliers detected**:
-- Algorithm thresholds may need adjustment for your data
-- Consider manual inspection of borderline cases
-- Review threshold sensitivity section above
-
-### Getting Help
-
-1. **Check file formats**: Ensure input files match expected structure
-2. **Verify sample matching**: Run diagnostic checks on sample names
-3. **Test with known cases**: Use the custom data testing example above
-4. **Manual validation**: Examine a few flagged cases to verify behavior
-
-## Contributing
-
-Issues and pull requests welcome! Please ensure:
-
-- Test with sample datasets
-- Document any parameter changes
-- Include examples for new features
-- Update README for significant changes
 
 ## Citation
 
-If you use this script in your research, please cite this repository and consider citing relevant differential expression methodology papers that inform the approach.
+If you use this script, please cite this repository together with the
+methodology references listed above (PMIDs 33709073, 40926263, 25516281,
+39478636).
+
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License.
