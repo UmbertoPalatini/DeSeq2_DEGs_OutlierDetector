@@ -65,7 +65,7 @@ counts in all samples of one group but consistent, high expression in
 all samples of the other group is a biologically valid signal
 (complete induction from a silent baseline). This script retains such
 genes as Clean, because rule 2 (sparse expression) only fires when
-fewer than three samples express the gene across the entire contrast —
+fewer than three samples express the gene across the entire contrast,
 a gene expressed in all five replicates of the treatment group has five
 non-zero observations and passes comfortably. Genes whose non-zero
 signal is confined to one or two samples regardless of group membership
@@ -268,17 +268,17 @@ A synthetic dataset is shipped under `example_data/` and can be
 regenerated with `generate_example_data.R`. It contains 41 genes and 10
 samples (two groups of five) covering:
 
-* 8 robust DEGs (consistent fold change up or down) — expected **Clean**.
+* 8 robust DEGs (consistent fold change up or down), expected **Clean**.
 * 4 zero-in-one-group DEGs: all control replicates are zero, all treatment
   replicates express the gene at high and consistent levels (complete
-  induction from a silent baseline) — expected **Clean**.
+  induction from a silent baseline), expected **Clean**.
 * 3 Outliers_Present: one treatment replicate is ~8x the group median,
-  the remaining four replicates still separate from control — expected
+  the remaining four replicates still separate from control, expected
   **Outliers_Present**.
 * 4 spike artifacts: one treatment replicate carries 14,000–27,000
-  normalised counts while the rest of the contrast sits near zero —
+  normalised counts while the rest of the contrast sits near zero,
   expected **Artifact** (rule 1).
-* 4 sparse_expression artifacts: expressed in only 1–2 samples total —
+* 4 sparse_expression artifacts: expressed in only 1–2 samples total,
   expected **Artifact** (rule 2).
 * 18 non-DEG background genes (padj > 0.05, not annotated).
 
@@ -306,7 +306,7 @@ subtype:
 
 The top block (green, Clean) shows both the robust fold-change DEGs and
 the zero-in-one-group genes: all control samples have low or zero counts
-while all treatment samples are consistently elevated — a coherent
+while all treatment samples are consistently elevated, a coherent
 biological signal. The middle block (yellow, Outliers_Present) shows
 genes where one treatment sample is markedly elevated above its peers
 but the remaining replicates still separate from control. The bottom
